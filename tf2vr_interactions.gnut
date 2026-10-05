@@ -1,0 +1,371 @@
+untyped
+
+global function TF2VR_InteractionsInit
+global function TF2VR_PredictGrenade
+global function TF2VR_Throwable
+global function TF2VR_GunSlot
+global function TF2VR_EmptyHands
+global const int TF2VR_ARC_TOOL_HOLSTER = 3
+global const int TF2VR_GRENADE_HOLSTER = 4
+#if SERVER
+global function TF2VR_GrabGrenade
+global function TF2VR_HoldGrenade
+global function TF2VR_EquipGun
+global function TF2VR_GiveEmptyHands
+#endif
+
+bool function TF2VR_Throwable( entity weapon )
+{
+	if ( !IsValid( weapon ) )
+		return false
+	return [ "mp_weapon_frag_grenade", "mp_weapon_grenade_emp", "mp_weapon_grenade_electric_smoke", "mp_weapon_grenade_gravity", "mp_weapon_grenade_sonar", "mp_weapon_thermite_grenade" ].contains( weapon.GetWeaponClassName() )
+}
+
+void function TF2VR_InteractionsInit()
+{
+#if SERVER
+	FlagInit( "TF2VR_DrewPrimary" )
+	FlagInit( "TF2VR_DrewSecondary" )
+	AddClientCommandCallback( "tf2vr_draw", TF2VR_Draw )
+	AddClientCommandCallback( "tf2vr_grenade", TF2VR_GrabGrenade )
+	AddClientCommandCallback( "tf2vr_cancel_grenade", TF2VR_CancelGrenade )
+	AddClientCommandCallback( "tf2vr_store_grenade", TF2VR_StoreGrenade )
+#else
+	SetConVarInt( "tf2vr_utility_entity", 0 )
+	SetConVarInt( "tf2vr_reload_highlight_entity", 0 )
+	SetConVarInt( "tf2vr_titan_transition_mask", CE_FLAG_EMBARK | CE_FLAG_DISEMBARK )
+	thread TF2VR_UtilityModel()
+	thread TF2VR_ReloadHighlight()
+	thread TF2VR_RackedRounds()
+	thread TF2VR_StopReloadSounds()
+	thread TF2VR_EmptyPouchHint()
+#endif
+}
+
+bool function TF2VR_EmptyHands( entity weapon )
+{
+	return weapon.GetWeaponClassName() == TF2VR_EMPTY_HANDS
+}
+
+int function TF2VR_GunSlot( entity weapon )
+{
+	return weapon.GetWeaponClassName() == CHARGE_TOOL ? TF2VR_ARC_TOOL_HOLSTER : weapon.GetInventoryIndex()
+}
+
+#if SERVER
+struct {
+	entity grenade
+	int grenadeTicket = 0
+	bool grenadeConsumesAmmo = true
+} file
+
+bool function TF2VR_Draw( entity player, array<string> args )
+{
+	Assert( args.len() == 2 )
+	int ticket = args[0].tointeger()
+	int slot = args[1].tointeger()
+	Assert( slot == 0 || slot == 1 || slot == TF2VR_ARC_TOOL_HOLSTER )
+	SetConVarInt( "tf2vr_gun_ack", -ticket )
+	if ( !IsAlive( player ) || player.IsTitan() || player.ContextAction_IsActive() )
+		return true
+	foreach ( entity weapon in player.GetMainWeapons() )
+	{
+		if ( TF2VR_GunSlot( weapon ) != slot )
+			continue
+		TF2VR_EquipGun( player, weapon, ticket )
+		if ( slot == 0 )
+			FlagSet( "TF2VR_DrewPrimary" )
+		if ( slot == 1 )
+			FlagSet( "TF2VR_DrewSecondary" )
+		return true
+	}
+	return true
+}
+
+void function TF2VR_EquipGun( entity player, entity weapon, int ticket )
+{
+	player.HolsterWeapon()
+	player.SetActiveWeaponByName( weapon.GetWeaponClassName() )
+	player.DeployWeapon()
+	SetConVarString( "tf2vr_gun_name", weapon.GetWeaponClassName() )
+	SetConVarInt( "tf2vr_gun_slot", TF2VR_GunSlot( weapon ) )
+	SetConVarInt( "tf2vr_gun_ack", ticket )
+}
+
+// TakeAllWeapons removes it with the rest
+void function TF2VR_GiveEmptyHands( entity player )
+{
+	player.GiveWeapon( TF2VR_EMPTY_HANDS )
+	player.SetActiveWeaponByName( TF2VR_EMPTY_HANDS )
+}
+
+void function TF2VR_PlayGrenadePickupSound( entity player )
+{
+	EmitSoundOnEntityOnlyToPlayer( player, player, "Pilot_Mvmt_Boost_Card_Activate_Cloth_Arm_Raise_1P" )
+}
+
+void function TF2VR_HoldGrenade( entity player, entity weapon, int ticket, bool consumesAmmo )
+{
+	file.grenade = weapon
+	file.grenadeTicket = ticket
+	file.grenadeConsumesAmmo = consumesAmmo
+	weapon.w.startChargeTime = Time() // cooking: same field vanilla's Grenade_OnWeaponTossPrep sets
+	SetConVarInt( "tf2vr_grenade_consumes_ammo", consumesAmmo ? 1 : 0 )
+	TF2VR_PlayGrenadePickupSound( player )
+	SetConVarInt( "tf2vr_grenade_ack", ticket )
+	thread TF2VR_GrenadeCookOff( player, weapon, ticket )
+}
+
+// cooking: if the grenade is still held when its fuse runs out, it goes off in your hand
+void function TF2VR_GrenadeCookOff( entity player, entity weapon, int ticket )
+{
+	player.EndSignal( "OnDeath" )
+	player.EndSignal( "OnDestroy" )
+	float fuseTime = weapon.GetGrenadeFuseTime()
+	if ( fuseTime <= 0.0 ) // impact grenades never cook off
+		return
+	wait fuseTime
+	// thrown, stored or cancelled while we waited: TF2VR_PredictGrenade, StoreGrenade and CancelGrenade all clear the ticket
+	if ( file.grenadeTicket != ticket || !IsValid( weapon ) )
+		return
+	file.grenadeTicket = 0
+	// the DLL empties the hand when the ack is minus the held ticket, the same path a rejected grab takes
+	SetConVarInt( "tf2vr_grenade_ack", -ticket )
+	int damage = weapon.GetWeaponDamageFlags()
+	entity grenade = weapon.FireWeaponGrenade( player.EyePosition(), <0, 0, 0>, <0, 0, 0>, 0.001, damage, damage, PROJECTILE_NOT_PREDICTED, true, true )
+	if ( IsValid( grenade ) )
+		Grenade_OnPlayerNPCTossGrenade_Common( weapon, grenade )
+	if ( file.grenadeConsumesAmmo )
+		weapon.SetWeaponPrimaryClipCount( weapon.GetWeaponPrimaryClipCount() - weapon.GetWeaponSettingInt( eWeaponVar.ammo_per_shot ) )
+	PlayerUsedOffhand( player, weapon )
+}
+
+bool function TF2VR_GrabGrenade( entity player, array<string> args )
+{
+	Assert( args.len() == 1 )
+	int ticket = args[0].tointeger()
+	SetConVarInt( "tf2vr_grenade_ack", -ticket )
+	if ( !IsAlive( player ) || player.IsTitan() || player.ContextAction_IsActive() || player.IsWeaponDisabled() )
+		return true
+	entity weapon = player.GetOffhandWeapon( OFFHAND_ORDNANCE )
+	if ( !TF2VR_Throwable( weapon ) || weapon.GetWeaponPrimaryClipCount() < weapon.GetWeaponSettingInt( eWeaponVar.ammo_per_shot ) )
+		return true
+	TF2VR_HoldGrenade( player, weapon, ticket, true )
+	return true
+}
+
+bool function TF2VR_CancelGrenade( entity player, array<string> args )
+{
+	Assert( args.len() == 1 )
+	if ( args[0].tointeger() == file.grenadeTicket )
+		file.grenadeTicket = 0
+	return true
+}
+
+bool function TF2VR_StoreGrenade( entity player, array<string> args )
+{
+	Assert( args.len() == 1 )
+	if ( args[0].tointeger() == file.grenadeTicket )
+	{
+		file.grenadeTicket = 0
+		TF2VR_PlayGrenadePickupSound( player )
+	}
+	return true
+}
+
+#else
+void function TF2VR_UtilityModel()
+{
+	entity prop
+	asset model = $""
+	while ( true )
+	{
+		entity player = GetLocalViewPlayer()
+		entity weapon
+		if ( IsValid( player ) && IsAlive( player ) && !player.IsTitan() && !player.IsWeaponDisabled() )
+			weapon = player.GetOffhandWeapon( OFFHAND_ORDNANCE )
+		bool visible = GetConVarInt( "tf2vr_chest_visible" ) != 0 && TF2VR_Throwable( weapon ) && weapon.GetWeaponPrimaryClipCount() > 0
+		if ( visible )
+		{
+			asset nextModel = GetWeaponInfoFileKeyFieldAsset_Global( weapon.GetWeaponClassName(), "playermodel" )
+			if ( nextModel != model )
+			{
+				if ( IsValid( prop ) )
+					prop.Destroy()
+				model = nextModel
+				prop = CreateClientSidePropDynamic( <0,0,0>, <0,0,0>, model )
+			}
+			prop.Show()
+			SetConVarInt( "tf2vr_utility_entity", prop.GetEntIndex() )
+		}
+		else
+		{
+			SetConVarInt( "tf2vr_utility_entity", 0 )
+			if ( IsValid( prop ) )
+				prop.Hide()
+		}
+		WaitFrame()
+	}
+}
+
+// native poses this viewmodel copy so only the mechanism awaiting the support hand or a ghost magazine remains
+void function TF2VR_ReloadHighlight()
+{
+	entity prop
+	asset model = $""
+	while ( true )
+	{
+		entity player = GetLocalViewPlayer()
+		entity viewModel
+		if ( GetConVarInt( "tf2vr_reload_highlight" ) != 0 && IsValid( player ) && IsAlive( player ) && !player.IsTitan() )
+			viewModel = player.GetViewModelEntity()
+		// disabled weapons leave the viewmodel without a model
+		if ( IsValid( viewModel ) && viewModel.GetModelName() != $"?" )
+		{
+			asset nextModel = viewModel.GetModelName()
+			if ( nextModel != model )
+			{
+				if ( IsValid( prop ) )
+					prop.Destroy()
+				model = nextModel
+				prop = CreateClientSidePropDynamic( <0,0,0>, <0,0,0>, model )
+				TF2VR_OutlineMechanism( prop )
+			}
+			prop.Show()
+			SetConVarInt( "tf2vr_reload_highlight_entity", prop.GetEntIndex() )
+		}
+		else
+		{
+			SetConVarInt( "tf2vr_reload_highlight_entity", 0 )
+			if ( IsValid( prop ) )
+				prop.Hide()
+		}
+		WaitFrame()
+	}
+}
+
+// native counts rounds thrown out by racking, shown with the weapon's own shell ejection
+void function TF2VR_RackedRounds()
+{
+	int previous = GetConVarInt( "tf2vr_reload_rounds" )
+	while ( true )
+	{
+		int rounds = GetConVarInt( "tf2vr_reload_rounds" )
+		entity player = GetLocalViewPlayer()
+		entity weapon = IsValid( player ) ? player.GetActiveWeapon() : null
+		if ( rounds > previous && IsValid( weapon ) )
+		{
+			var attachment = weapon.GetWeaponInfoFileKeyField( "fx_shell_eject_attach" )
+			if ( attachment != null )
+				weapon.PlayWeaponEffect( weapon.GetWeaponInfoFileKeyFieldAsset( "fx_shell_eject_view" ), weapon.GetWeaponInfoFileKeyFieldAsset( "fx_shell_eject_world" ), expect string( attachment ) )
+		}
+		previous = rounds
+		WaitFrame()
+	}
+}
+
+// native counts squeezes at the magazine pouch with no reserve ammo left
+void function TF2VR_EmptyPouchHint()
+{
+	OnscreenHint hint
+	hint.locStringGamepad = "#TF2VR_HINT_NO_AMMO"
+	hint.adsFade = false
+	int previous = GetConVarInt( "tf2vr_reload_empty_grabs" )
+	while ( true )
+	{
+		int grabs = GetConVarInt( "tf2vr_reload_empty_grabs" )
+		if ( grabs > previous )
+			thread DisplayOnscreenHint( hint, 4.0 )
+		previous = grabs
+		WaitFrame()
+	}
+}
+
+// native names a pull clip to stop before the release half it also carries
+void function TF2VR_StopReloadSounds()
+{
+	while ( true )
+	{
+		string sound = GetConVarString( "tf2vr_reload_stop_sound" )
+		entity player = GetLocalViewPlayer()
+		entity weapon = IsValid( player ) ? player.GetActiveWeapon() : null
+		if ( sound != "" )
+		{
+			if ( IsValid( weapon ) )
+				weapon.StopWeaponSound( sound )
+			SetConVarString( "tf2vr_reload_stop_sound", "" )
+		}
+		WaitFrame()
+	}
+}
+
+// viewmodel sonar fill and outline in the selected world pickup color, without drawing the prop itself
+void function TF2VR_OutlineMechanism( entity prop )
+{
+	HighlightContext highlight = GetHighlight( "weapon_drop_active" )
+	int neutral = 0
+	int viewModelColor = 114
+	// highlight after the gun draws, which covers world pass highlights
+	prop.RenderWithViewModels( true )
+	prop.Highlight_SetCurrentContext( neutral )
+	prop.Highlight_SetFunctions( neutral, viewModelColor, false, viewModelColor, 8.0, prop.Highlight_GetState( neutral ), false )
+	prop.Highlight_SetParam( neutral, 0, highlight.paramVecs[0] )
+	prop.Highlight_SetParam( neutral, 1, highlight.paramVecs[1] )
+	prop.Highlight_SetVisibilityType( HIGHLIGHT_VIS_ALWAYS )
+	prop.Highlight_SetNearFadeDist( 0 )
+	prop.Highlight_SetFarFadeDist( 100000 )
+	prop.Highlight_SetFadeInTime( 0 )
+	prop.Highlight_SetFadeOutTime( 0 )
+	prop.Highlight_StartOn()
+}
+#endif
+
+void function TF2VR_PredictGrenade( int ticket, int consumesAmmo, vector position, vector angles, vector velocity, vector spin )
+{
+#if SERVER
+	entity player = GetPlayerArray()[0]
+	Assert( ticket == file.grenadeTicket && IsValid( file.grenade ) && (consumesAmmo != 0) == file.grenadeConsumesAmmo )
+	entity weapon = file.grenade
+	bool launch = true
+#else
+	entity player = GetLocalViewPlayer()
+	entity weapon = player.GetOffhandWeapon( OFFHAND_ORDNANCE )
+	bool launch = weapon.ShouldPredictProjectiles()
+#endif
+	weapon.AddMod( "tf2vr_throw" )
+	int cost = weapon.GetWeaponSettingInt( eWeaponVar.ammo_per_shot )
+	Assert( weapon.GetWeaponPrimaryClipCount() >= cost )
+	if ( launch )
+	{
+		int damage = weapon.GetWeaponDamageFlags()
+		float fuseTime = weapon.GetGrenadeFuseTime()
+#if SERVER
+		// cooking: same formula as vanilla's Grenade_Launch, fuse 0 means impact grenade so it's left alone
+		if ( fuseTime > 0.0 )
+		{
+			fuseTime -= Time() - weapon.w.startChargeTime
+			if ( fuseTime <= 0.0 )
+				fuseTime = 0.001
+		}
+#endif
+		entity grenade = weapon.FireWeaponGrenade( position, AnglesToForward( angles ), spin, fuseTime, damage, damage, true, false, true )
+		Assert( IsValid( grenade ) )
+		grenade.SetScriptName( "tf2vr_thrown_grenade" )
+		grenade.SetAngles( angles )
+		grenade.SetVelocity( velocity )
+#if SERVER
+		Grenade_OnPlayerNPCTossGrenade_Common( weapon, grenade )
+		file.grenadeTicket = 0
+#else
+		Grenade_Init( grenade, weapon )
+		SetConVarInt( "tf2vr_projectile_entity", grenade.GetEntIndex() )
+		SetConVarInt( "tf2vr_projectile_ticket", ticket )
+#endif
+		Assert( Distance( grenade.GetVelocity(), velocity ) < 0.01 )
+		weapon.EmitWeaponSound_1p3p( GetGrenadeDeploySound_1p( weapon ), GetGrenadeDeploySound_3p( weapon ) )
+		weapon.EmitWeaponSound_1p3p( GetGrenadeThrowSound_1p( weapon ), GetGrenadeThrowSound_3p( weapon ) )
+	}
+	if ( consumesAmmo != 0 )
+		weapon.SetWeaponPrimaryClipCount( weapon.GetWeaponPrimaryClipCount() - cost )
+	PlayerUsedOffhand( player, weapon )
+}
